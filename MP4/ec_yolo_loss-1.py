@@ -1,0 +1,292 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+
+
+def compute_iou(box1, box2):
+    """Compute the intersection over union of two set of boxes, each box is [x1,y1,x2,y2].
+    Args:
+      box1: (tensor) bounding boxes, sized [N,4].
+      box2: (tensor) bounding boxes, sized [M,4].
+    Return:
+      (tensor) iou, sized [N,M].
+    """
+    N = box1.size(0)
+    M = box2.size(0)
+
+    lt = torch.max(
+        box1[:, :2].unsqueeze(1).expand(N, M, 2),  # [N,2] -> [N,1,2] -> [N,M,2]
+        box2[:, :2].unsqueeze(0).expand(N, M, 2),  # [M,2] -> [1,M,2] -> [N,M,2]
+    )
+
+    rb = torch.min(
+        box1[:, 2:].unsqueeze(1).expand(N, M, 2),  # [N,2] -> [N,1,2] -> [N,M,2]
+        box2[:, 2:].unsqueeze(0).expand(N, M, 2),  # [M,2] -> [1,M,2] -> [N,M,2]
+    )
+
+    wh = rb - lt  # [N,M,2]
+    wh[wh < 0] = 0  # clip at 0
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
+
+    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])  # [N,]
+    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])  # [M,]
+    area1 = area1.unsqueeze(1).expand_as(inter)  # [N,] -> [N,1] -> [N,M]
+    area2 = area2.unsqueeze(0).expand_as(inter)  # [M,] -> [1,M] -> [N,M]
+
+    eps = 1e-6
+    iou = inter / (area1 + area2 - inter + eps)
+    return iou
+
+
+
+class YoloLoss(nn.Module):
+
+    def __init__(self, S, B, l_coord, l_noobj):
+        super(YoloLoss, self).__init__()
+        self.S = S
+        self.B = B
+        self.l_coord = l_coord
+        self.l_noobj = l_noobj
+
+    def xywh2xyxy(self, boxes):
+        """
+        Parameters:
+        boxes: (N,4) representing by x,y,w,h
+
+        Returns:
+        boxes: (N,4) representing by x1,y1,x2,y2
+
+        if for a Box b the coordinates are represented by [x, y, w, h] then
+        x1, y1 = x/S - 0.5*w, y/S - 0.5*h ; x2,y2 = x/S + 0.5*w, y/S + 0.5*h
+        Note: Over here initially x, y are the center of the box and w,h are width and height.
+        """
+        ### CODE ###
+        # Your code here
+        x, y, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        # Normalize x and y by S according to the instructions
+        x = x / self.S
+        y = y / self.S
+        x1 = x - 0.5 * w
+        y1 = y - 0.5 * h
+        x2 = x + 0.5 * w
+        y2 = y + 0.5 * h
+        converted = torch.stack([x1, y1, x2, y2], dim=1)
+        return converted
+
+    def find_best_iou_boxes(self, pred_box_list, box_target):
+        """
+        Parameters:
+        box_pred_list : (list) [(tensor) size (-1, 5)]  
+        box_target : (tensor)  size (-1, 4)
+
+        Returns:
+        best_iou: (tensor) size (-1, 1)
+        best_boxes : (tensor) size (-1, 5), containing the boxes which give the best iou among the two (self.B) predictions
+
+        Hints:
+        1) Find the iou's of each of the 2 bounding boxes of each grid cell of each image.
+        2) For finding iou's use the compute_iou function
+        3) use xywh2xyxy to convert bbox format if necessary,
+        Note: Over here initially x, y are the center of the box and w,h are width and height.
+        We perform this transformation to convert the correct coordinates into bounding box coordinates.
+        """
+
+        ### CODE ###
+        # Your code here
+        transformed_target = self.xywh2xyxy(box_target)
+        total_targets = transformed_target.size(0)
+        best_iou_values = torch.zeros(total_targets).to('cuda')
+        best_pred_boxes = torch.zeros(total_targets, 5).to('cuda')
+        for i in range(total_targets):
+          current_target = transformed_target[i].unsqueeze(0) 
+          current_best = -1.0
+          best_box = None
+          for candidate in pred_box_list:
+            candidate_box = candidate[i, :4].unsqueeze(0)  
+            candidate_box_conv = self.xywh2xyxy(candidate_box)
+            iou_val = compute_iou(candidate_box_conv, current_target)[0, 0]
+            if iou_val > current_best:
+              current_best = iou_val
+              best_box = candidate[i]
+          if best_box is None:
+            best_box = pred_box_list[0][i]
+
+          best_iou_values[i] = current_best
+          best_pred_boxes[i] = best_box
+        return best_iou_values.unsqueeze(1).detach(), best_pred_boxes
+
+
+
+
+    def get_class_prediction_loss(self, classes_pred, classes_target, has_object_map):
+        """
+        Parameters:
+        classes_pred : (tensor) size (batch_size, S, S, 20)
+        classes_target : (tensor) size (batch_size, S, S, 20)
+        has_object_map: (tensor) size (batch_size, S, S)
+
+        Returns:
+        class_loss : scalar
+        """
+        ### CODE ###
+        # Your code here
+        difference = classes_pred - classes_target
+        sample_loss = difference.pow(2).sum(dim=-1)
+        total_loss = (sample_loss * has_object_map).sum()
+        return total_loss
+
+    def get_no_object_loss(self, pred_boxes_list, has_object_map):
+        """
+        Parameters:
+        pred_boxes_list: (list) [(tensor) size (N, S, S, 5)  for B pred_boxes]
+        has_object_map: (tensor) size (N, S, S)
+
+        Returns:
+        loss : scalar
+
+        Hints:
+        1) Only compute loss for cell which doesn't contain object
+        2) compute loss for all predictions in the pred_boxes_list list
+        3) You can assume the ground truth confidence of non-object cells is 0
+        """
+        ### CODE
+        absence_mask = ~has_object_map  
+        loss_total = 0.0
+        for b in range(self.B):
+          channel_four = pred_boxes_list[b][:, :, :, 4]
+          selected_values = channel_four[absence_mask]
+          zero_reference = torch.zeros_like(selected_values, dtype=torch.float).cuda()
+          loss_total += F.mse_loss(selected_values.float(), zero_reference, reduction='sum')
+        final_loss = loss_total * self.l_noobj
+        return final_loss
+
+    def get_contain_conf_loss(self, box_pred_conf, box_target_conf):
+        """
+        Parameters:
+        box_pred_conf : (tensor) size (-1,1)
+        box_target_conf: (tensor) size (-1,1)
+
+        Returns:
+        contain_loss : scalar
+
+        Hints:
+        The box_target_conf should be treated as ground truth, i.e., no gradient
+
+        """
+        ### CODE
+        loss = F.mse_loss(box_pred_conf.float(), box_target_conf.float(), reduction='sum')
+        return loss
+
+    def get_regression_loss(self, box_pred_response, box_target_response):
+        """
+        Parameters:
+        box_pred_response : (tensor) size (-1, 4)
+        box_target_response : (tensor) size (-1, 4)
+        Note : -1 corresponds to ravels the tensor into the dimension specified
+        See : https://pytorch.org/docs/stable/tensors.html#torch.Tensor.view_as
+
+        Returns:
+        reg_loss : scalar
+
+        """
+        ### CODE
+        center_diff = box_pred_response[:, :2] - box_target_response[:, :2]
+        center_err = center_diff.pow(2).sum(dim=1)
+        eps = 1e-6
+        pred_size = torch.sqrt(torch.clamp(box_pred_response[:, 2:4], min=eps))
+        target_size = torch.sqrt(torch.clamp(box_target_response[:, 2:4], min=eps))
+
+        size_err = (pred_size - target_size).pow(2).sum(dim=1)
+        total_loss = torch.sum(center_err + size_err) * self.l_coord
+        return total_loss
+
+    def forward(self, pred_tensor, target_boxes, target_cls, has_object_map):
+        """
+        pred_tensor: (tensor) size(N,S,S,Bx5+20=30) where:  
+                            N - batch_size
+                            S - width/height of network output grid
+                            B - number of bounding boxes this grid cell is a part of = 2
+                            5 - number of bounding box values corresponding to [x, y, w, h, c]
+                                where x - x_coord, y - y_coord, w - width, h - height, c - confidence of having an object
+                            20 - number of classes
+
+        target_boxes: (tensor) size (N, S, S, 4): the ground truth bounding boxes
+        target_cls: (tensor) size (N, S, S, 20): the ground truth class
+        has_object_map: (tensor, bool) size (N, S, S): the ground truth for whether each cell contains an object (True/False)
+
+        Returns:
+        loss_dict (dict): with key value stored for total_loss, reg_loss, containing_obj_loss, no_obj_loss and cls_loss
+        """
+        batch_size = pred_tensor.size(0)
+        cls_predictions = pred_tensor[:, :, :, self.B * 5:]
+        bbox_predictions = [pred_tensor[:, :, :, i * 5:(i + 1) * 5] for i in range(self.B)]
+        loss_cls = self.get_class_prediction_loss(cls_predictions, target_cls, has_object_map)
+        loss_no_obj = self.get_no_object_loss(bbox_predictions, has_object_map)
+        filtered_bboxes = [box_pred[has_object_map] for box_pred in bbox_predictions]
+        valid_boxes = target_boxes[has_object_map]
+        best_iou, best_bbox = self.find_best_iou_boxes(filtered_bboxes, valid_boxes)
+        loss_reg = self.get_regression_loss(best_bbox[:, :4], valid_boxes)
+        loss_contain = self.get_contain_conf_loss(best_bbox[:, 4].unsqueeze(-1), best_iou)
+        total_loss = (loss_cls + loss_no_obj + loss_contain + loss_reg) / batch_size
+        loss_dict = {
+        'total_loss': total_loss,
+        'reg_loss': loss_reg,
+        'containing_obj_loss': loss_contain,
+        'no_obj_loss': loss_no_obj,
+        'cls_loss': loss_cls,}
+    
+        return loss_dict
+class AltYoloLoss(YoloLoss):
+    def __init__(self, S, B, l_coord, l_noobj, gamma=2.0, alpha=0.25):
+        super(AltYoloLoss, self).__init__(S, B, l_coord, l_noobj)
+        self.gamma = gamma
+        self.alpha = alpha
+
+    def get_class_prediction_loss(self, classes_pred, classes_target, has_object_map):
+        p  = torch.sigmoid(classes_pred)
+        pt = p*classes_target + (1-p)*(1-classes_target)
+        w  = self.alpha * (1-pt).pow(self.gamma)
+        bce= F.binary_cross_entropy(p, classes_target, reduction='none')
+        loss = (w * bce).sum(dim=-1)
+        return (loss * has_object_map).sum()
+
+    def get_no_object_loss(self, pred_boxes_list, has_object_map):
+        total = 0.0
+        for i in range(self.B):
+            conf = torch.sigmoid(pred_boxes_list[i][...,4])
+            w    = (1-conf).pow(self.gamma)
+            bce  = F.binary_cross_entropy(conf,
+                                          torch.zeros_like(conf),
+                                          reduction='none')
+            total += (w * bce * (~has_object_map)).sum()
+        return total * self.l_noobj
+
+    def forward(self, pred_tensor, target_boxes, target_cls, has_object_map):
+        cls_pred   = pred_tensor[..., self.B*5:]
+        bbox_preds = [pred_tensor[..., i*5:(i+1)*5] for i in range(self.B)]
+
+        loss_cls   = self.get_class_prediction_loss(cls_pred,
+                                                    target_cls,
+                                                    has_object_map)
+        loss_noobj = self.get_no_object_loss(bbox_preds, has_object_map)
+
+        filtered = [b[has_object_map] for b in bbox_preds]
+        gt_boxes  = target_boxes[has_object_map]
+        best_iou, best_box = self.find_best_iou_boxes(filtered, gt_boxes)
+
+        loss_reg = (1 - best_iou).sum() * self.l_coord
+
+        
+        loss_obj = F.mse_loss(best_box[:,4].unsqueeze(-1),
+                              best_iou.detach(),
+                              reduction='sum')
+
+        total = (loss_cls + loss_noobj + loss_reg + loss_obj) / pred_tensor.size(0)
+        return {
+            'total_loss': total,
+            'cls_loss'  : loss_cls,
+            'no_obj_loss': loss_noobj,
+            'reg_loss'  : loss_reg,
+            'obj_loss'  : loss_obj
+        }
